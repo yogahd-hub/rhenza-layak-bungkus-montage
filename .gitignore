@@ -1,0 +1,8 @@
+*.mp4
+*.mov
+*.MOV
+work/
+final/
+__pycache__/
+rclone.conf
+*.json.key

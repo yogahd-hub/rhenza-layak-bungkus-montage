@@ -1,0 +1,287 @@
+name: Montage + SRT (Layak Bungkus)
+
+on:
+  workflow_dispatch:
+    inputs:
+      WHISPER_MODEL:
+        description: "Model faster-whisper (small = default; medium lebih akurat tapi jauh lebih lama)"
+        type: choice
+        options: [small, base, tiny, medium, large-v3]
+        default: small
+      PAD_MODE:
+        description: "Background untuk klip landscape: blur atau black"
+        type: choice
+        options: [blur, black]
+        default: blur
+      TITLE_CARD:
+        description: "Sisipkan kartu penanda 0,5 detik (nomor + nama file) sebelum tiap klip"
+        type: choice
+        options: ["true", "false"]
+        default: "true"
+      MAX_PART_MINUTES:
+        description: "Durasi maksimal per part montage (menit)"
+        type: string
+        default: "10"
+      TEST_LIMIT:
+        description: "Uji coba: proses N file pertama saja (0 = semua file)"
+        type: string
+        default: "0"
+      SOURCE:
+        description: "Cara mengambil file Drive: rclone (pakai secret RCLONE_CONFIG) atau gdown (folder publik, maks 50 file)"
+        type: choice
+        options: [rclone, gdown]
+        default: rclone
+      AUTO_EDITOR:
+        description: "Opsional: buat versi tambahan tiap part tanpa jeda hening (auto-editor)"
+        type: choice
+        options: ["false", "true"]
+        default: "false"
+
+permissions:
+  contents: write
+  actions: write   # untuk menghapus artifact sementara (klip per batch) setelah selesai
+
+concurrency:
+  group: montage
+  cancel-in-progress: false
+
+env:
+  BATCH_SIZE: "12"
+  DRIVE_FOLDER_ID: ${{ vars.DRIVE_FOLDER_ID }}
+  DRIVE_OUTPUT_FOLDER_ID: ${{ vars.DRIVE_OUTPUT_FOLDER_ID }}
+  SOURCE: ${{ inputs.SOURCE }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  list:
+    name: 1. Daftar file Drive
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      matrix: ${{ steps.list.outputs.matrix }}
+      count: ${{ steps.list.outputs.count }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cek variable
+        run: |
+          if [ -z "$DRIVE_FOLDER_ID" ]; then
+            echo "::error::Repository variable DRIVE_FOLDER_ID belum diisi (Settings → Secrets and variables → Actions → Variables)."
+            exit 1
+          fi
+          echo "Folder sumber: $DRIVE_FOLDER_ID | mode: $SOURCE | TEST_LIMIT=${{ inputs.TEST_LIMIT }}"
+
+      - name: Pasang rclone
+        if: env.SOURCE == 'rclone'
+        env:
+          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          if [ -z "$RCLONE_CONFIG_CONTENT" ]; then
+            echo "::error::Secret RCLONE_CONFIG kosong. Isi dulu, atau jalankan dengan SOURCE=gdown."; exit 1
+          fi
+          curl -fsSL https://rclone.org/install.sh | sudo bash > /dev/null
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
+          rclone version | head -1
+          rclone listremotes | grep -q '^gdrive:$' || { echo "::error::Remote 'gdrive' tidak ada di RCLONE_CONFIG"; exit 1; }
+
+      - name: Pasang gdown
+        if: env.SOURCE == 'gdown'
+        run: pip install --quiet gdown
+
+      - name: Daftar, dedupe, urutkan, bagi batch
+        id: list
+        run: |
+          if [ "$SOURCE" = "rclone" ]; then
+            rclone lsjson gdrive: --drive-root-folder-id "$DRIVE_FOLDER_ID" \
+              --hash --files-only -R > lsjson.json
+            echo "rclone menemukan $(jq length lsjson.json) file"
+            python scripts/list_drive.py --lsjson lsjson.json --out manifest.json \
+              --batch-size "$BATCH_SIZE" --test-limit "${{ inputs.TEST_LIMIT }}" >> "$GITHUB_OUTPUT"
+          else
+            python scripts/list_drive.py --gdown-folder "$DRIVE_FOLDER_ID" --out manifest.json \
+              --batch-size "$BATCH_SIZE" --test-limit "${{ inputs.TEST_LIMIT }}" >> "$GITHUB_OUTPUT"
+          fi
+          cat "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: manifest
+          path: manifest.json
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  process:
+    name: 2. Proses batch ${{ matrix.batch }}
+    needs: list
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.list.outputs.matrix) }}
+    env:
+      PAD_MODE: ${{ inputs.PAD_MODE }}
+      WHISPER_MODEL: ${{ inputs.WHISPER_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bebaskan disk runner
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Pasang ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg jq fonts-dejavu-core > /dev/null
+          ffmpeg -version | head -1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Pasang faster-whisper
+        run: pip install --quiet -r requirements.txt
+
+      - name: Cache model whisper
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: whisper-${{ inputs.WHISPER_MODEL }}-v1
+
+      - name: Pasang rclone
+        if: env.SOURCE == 'rclone'
+        env:
+          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          curl -fsSL https://rclone.org/install.sh | sudo bash > /dev/null
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
+
+      - name: Pasang gdown
+        if: env.SOURCE == 'gdown'
+        run: pip install --quiet gdown
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: manifest
+
+      - name: Download → normalisasi → transkrip
+        run: scripts/process_batch.sh manifest.json "${{ matrix.batch }}" "$RUNNER_TEMP/work"
+
+      - name: Upload hasil batch
+        uses: actions/upload-artifact@v4
+        with:
+          name: batch-${{ matrix.batch }}
+          path: ${{ runner.temp }}/work/out
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  assemble:
+    name: 3. Susun montage + SRT
+    needs: [list, process]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bebaskan disk runner
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune --all --force > /dev/null 2>&1 || true
+          df -h / | tail -1
+
+      - name: Pasang ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg jq fonts-dejavu-core > /dev/null
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: batch-*
+          path: ${{ runner.temp }}/artifacts
+
+      - name: Susun part, concat, gabung SRT, index.csv
+        run: |
+          python scripts/assemble.py --in-dir "$RUNNER_TEMP/artifacts" --out-dir "$RUNNER_TEMP/final" \
+            --title-card "${{ inputs.TITLE_CARD }}" --max-part-minutes "${{ inputs.MAX_PART_MINUTES }}"
+          rm -rf "$RUNNER_TEMP/artifacts"
+          ls -lh "$RUNNER_TEMP/final"
+          echo "----- awal multiple_srt_layak_bungkus.txt -----"
+          head -n 30 "$RUNNER_TEMP/final/multiple_srt_layak_bungkus.txt"
+          echo "----- index.csv -----"
+          cat "$RUNNER_TEMP/final/index.csv"
+
+      - name: (Opsional) auto-editor — buang jeda hening
+        if: inputs.AUTO_EDITOR == 'true'
+        run: |
+          pip install --quiet auto-editor
+          for f in "$RUNNER_TEMP"/final/montage_part??.mp4; do
+            echo "auto-editor: $f"
+            auto-editor "$f" --margin 0.3sec --no-open -o "${f%.mp4}_tanpa_jeda.mp4"
+          done
+          echo "::notice::File *_tanpa_jeda.mp4 TIDAK cocok dengan SRT (timestamp bergeser). Pakai part asli untuk subtitle."
+
+      - name: Simpan SRT + CSV sebagai artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: srt-dan-index
+          path: |
+            ${{ runner.temp }}/final/*.srt
+            ${{ runner.temp }}/final/*.txt
+            ${{ runner.temp }}/final/index.csv
+          retention-days: 30
+
+      - name: Upload ke folder Drive output
+        id: drive
+        env:
+          RCLONE_CONFIG_CONTENT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          if [ -z "$RCLONE_CONFIG_CONTENT" ] || [ -z "$DRIVE_OUTPUT_FOLDER_ID" ]; then
+            echo "::warning::RCLONE_CONFIG atau DRIVE_OUTPUT_FOLDER_ID kosong → upload ke Drive dilewati. Video disimpan sebagai artifact 'montage-video' (3 hari)."
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -fsSL https://rclone.org/install.sh | sudo bash > /dev/null
+          mkdir -p ~/.config/rclone
+          printf '%s\n' "$RCLONE_CONFIG_CONTENT" > ~/.config/rclone/rclone.conf
+          dest="montage_run${GITHUB_RUN_NUMBER}_$(date +%Y%m%d)"
+          [ "${{ inputs.TEST_LIMIT }}" != "0" ] && dest="${dest}_TEST"
+          rclone copy "$RUNNER_TEMP/final" "gdrive:$dest" --drive-root-folder-id "$DRIVE_OUTPUT_FOLDER_ID" \
+            --transfers 4 --drive-chunk-size 64M --stats 30s --stats-one-line -v
+          echo "::notice::Hasil di-upload ke subfolder '$dest' di folder Drive output."
+          echo "uploaded=true" >> "$GITHUB_OUTPUT"
+
+      - name: Cadangan — simpan video sebagai artifact (jika tidak ke Drive)
+        if: steps.drive.outputs.uploaded == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: montage-video
+          path: ${{ runner.temp }}/final/*.mp4
+          compression-level: 0
+          retention-days: 3
+
+      - name: Commit SRT + index.csv ke repo
+        run: |
+          cp "$RUNNER_TEMP/final/multiple_srt_layak_bungkus.txt" "$RUNNER_TEMP/final/index.csv" output/
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add output/
+          if git diff --cached --quiet; then echo "Tidak ada perubahan."; exit 0; fi
+          msg="Hasil montage run #${GITHUB_RUN_NUMBER}"
+          [ "${{ inputs.TEST_LIMIT }}" != "0" ] && msg="$msg (TEST_LIMIT=${{ inputs.TEST_LIMIT }})"
+          git commit -m "$msg"
+          for i in 1 2 3; do git pull --rebase -q && git push && break; sleep 5; done
+
+      - name: Hapus artifact sementara (klip per batch)
+        if: success()
+        uses: geekyeggo/delete-artifact@v5
+        with:
+          name: batch-*
+          failOnError: false
