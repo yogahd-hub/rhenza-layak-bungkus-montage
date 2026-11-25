@@ -11,7 +11,7 @@ manifest="$1"; batch="$2"; work="$3"
 SOURCE="${SOURCE:-rclone}"; PAD_MODE="${PAD_MODE:-blur}"; WHISPER_MODEL="${WHISPER_MODEL:-small}"
 here="$(cd "$(dirname "$0")" && pwd)"
 
-mkdir -p "$work/src" "$work/out/clips" "$work/out/srt" "$work/out/meta"
+mkdir -p "$work/src" "$work/out/clips" "$work/out/srt" "$work/out/meta" "$work/out/thumbs"
 
 mapfile -t rows < <(jq -c --argjson b "$batch" '.files[] | select(.batch == $b)' "$manifest")
 echo "::group::Batch ${batch}: ${#rows[@]} file"
@@ -44,6 +44,13 @@ for r in "${rows[@]}"; do
   orient=$(cat "$out.orient"); rm -f "$out.orient"
   dur=$(ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 "$out")
   rm -f "$src"   # hemat disk runner
+
+  # 3 potongan layar (15%, 50%, 85%) untuk lembar kontak
+  for k in 1 2 3; do
+    ss=$(awk -v d="$dur" -v k="$k" 'BEGIN{f=(k==1)?0.15:((k==2)?0.5:0.85); printf "%.2f", d*f}')
+    ffmpeg -hide_banner -loglevel error -y -ss "$ss" -i "$out" -frames:v 1 -vf scale=270:480 \
+      -q:v 4 "$work/out/thumbs/${nnn}_${k}.jpg" || true
+  done
 
   jq -n --argjson r "$r" --arg md5 "$md5" --arg orient "$orient" --arg dur "$dur" \
     '$r + {md5_local: $md5, orientasi: $orient, durasi: ($dur|tonumber)}' \

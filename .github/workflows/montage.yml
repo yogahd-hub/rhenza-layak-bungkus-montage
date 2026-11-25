@@ -201,6 +201,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg jq fonts-dejavu-core > /dev/null
+          pip install --quiet pillow
 
       - uses: actions/download-artifact@v4
         with:
@@ -236,6 +237,7 @@ jobs:
             ${{ runner.temp }}/final/*.srt
             ${{ runner.temp }}/final/*.txt
             ${{ runner.temp }}/final/index.csv
+            ${{ runner.temp }}/final/kontak/*.jpg
           retention-days: 30
 
       - name: Upload ke folder Drive output

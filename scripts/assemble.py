@@ -72,6 +72,41 @@ def run(cmd):
     subprocess.run([str(c) for c in cmd], check=True)
 
 
+def make_contact_sheets(clips, dest: Path, per_sheet=12, cols=3):
+    """Lembar kontak: tiap klip = 3 potongan layar + label nomor & nama file."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        log("Pillow tidak ada -> lembar kontak dilewati")
+        return
+    tw, th, lab = 270, 480, 40
+    cw, ch = tw * 3 + 20, th + lab + 20
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 22)
+    except OSError:
+        font = ImageFont.load_default()
+    dest.mkdir(parents=True, exist_ok=True)
+    for si in range(0, len(clips), per_sheet):
+        group = clips[si:si + per_sheet]
+        rows = (len(group) + cols - 1) // cols
+        sheet = Image.new("RGB", (cw * cols, ch * rows), "white")
+        d = ImageDraw.Draw(sheet)
+        for gi, m in enumerate(group):
+            x0, y0 = (gi % cols) * cw + 10, (gi // cols) * ch + 10
+            label = f"#{m['final_no']} {m['name']}"[:60]
+            d.text((x0, y0 + 8), label, fill="black", font=font)
+            thumbs_dir = Path(m["clip_path"]).parent.parent / "thumbs"
+            src_no = Path(m["clip_path"]).stem
+            for k in range(3):
+                tp = thumbs_dir / f"{src_no}_{k + 1}.jpg"
+                if tp.exists():
+                    im = Image.open(tp).convert("RGB").resize((tw, th))
+                    sheet.paste(im, (x0 + k * tw, y0 + lab))
+        out = dest / f"kontak_{si // per_sheet + 1:02d}.jpg"
+        sheet.save(out, quality=80)
+        log(f"lembar kontak {out.name}: klip #{group[0]['final_no']}-#{group[-1]['final_no']}")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in-dir", required=True)
@@ -222,6 +257,8 @@ def main():
                                            "start_di_part", "end_di_part", "orientasi"])
         w.writeheader()
         w.writerows(index_rows)
+
+    make_contact_sheets(clips, out_dir / "kontak")
 
     shutil.rmtree(work, ignore_errors=True)
     log(f"selesai: {len(parts)} part, {len(clips)} klip, {cue_no} cue")
